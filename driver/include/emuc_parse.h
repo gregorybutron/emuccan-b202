@@ -6,11 +6,12 @@
 #define    ID_LEN           4
 #define    DATA_LEN         8
 #define    COM_BUF_LEN      17
-#define    DATA_LEN_ERR     12
+#define    DATA_LEN_ERR     6
 #define    TIME_CHAR_NUM    13
 #define    CMD_HEAD_INIT    0x61
 #define    CMD_HEAD_SEND    0xE0
 #define    CMD_HEAD_RECV    0xE1
+#define    CMD_HEAD_ERROR   0x99
 
 /*--------------------------------------*/
 enum

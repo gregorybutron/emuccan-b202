@@ -65,10 +65,6 @@ int EMUCRevHex (EMUC_CAN_FRAME *frame)
 /*--------------------------------------*/
 #endif
 
-  /* head - byte 0 */
-  if(*p != CMD_HEAD_RECV)
-    return -1;
-
   /* check sum - byte 14 */
   for(i=0; i<COM_BUF_LEN-3; i++)
     chk_sum = chk_sum + *(p + i);
@@ -76,19 +72,29 @@ int EMUCRevHex (EMUC_CAN_FRAME *frame)
   if(chk_sum != *(p+14))
     return -2;
 
-  /* func - byte 1 */
-  frame->CAN_port = ((int) ( *(p+1) & 0x03)) - 1;
-  frame->id_type  = ((int) ((*(p+1) & 0x04) >> 2)) + 1;
-  frame->rtr      =  (int) ((*(p+1) & 0x08) >> 3);
-  frame->dlc      =  (int) ((*(p+1) & 0xF0) >> 4);
+  /* head - byte 0 */
+  if(*p == CMD_HEAD_RECV)
+  {
+    /* func - byte 1 */
+    frame->CAN_port = ((int) ( *(p+1) & 0x03)) - 1;
+    frame->id_type  = ((int) ((*(p+1) & 0x04) >> 2)) + 1;
+    frame->rtr      =  (int) ((*(p+1) & 0x08) >> 3);
+    frame->dlc      =  (int) ((*(p+1) & 0xF0) >> 4);
 
-  /* id - byte 2 ~ byte 5 */
-  memcpy(frame->id, p+2, ID_LEN);
+    /* id - byte 2 ~ byte 5 */
+    memcpy(frame->id, p+2, ID_LEN);
 
-  /* data - byte 6 ~ byte 13 */
-  memcpy(frame->data, p+6, DATA_LEN);
+    /* data - byte 6 ~ byte 13 */
+    memcpy(frame->data, p+6, DATA_LEN);
 
-  return 0;
+    return 0;
+  }
+  else if(*p == CMD_HEAD_ERROR)
+  {
+    return 1;
+  }
+  else
+    return -1;
 
 } /* END: EMUCRevHex() */
 

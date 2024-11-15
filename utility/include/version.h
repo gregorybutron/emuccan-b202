@@ -14,9 +14,18 @@
  *            - must use SocketCAN driver >= ver 2.5
  *            - EMUC device will auto active after setting up "two" CAN port
  *            - modify run_emucd: check emuc_64, ip link successfully
+ *  @ ver 3.0 - Start to support high level CANbus protocal
+ *            - Add INNO_XMIT_MODEL_CMD ioctl command
+ *            - must use SocketCAN driver >= ver 3.0
+ *  @ ver 3.1 - Start to support EMUCSetErrorType
+ *            - must use SocketCAN driver >= ver 3.1
+ *  @ ver 3.2 - Add HIGH_LEVEL_PROTOCAL flag
+ *            - inactive device without check return code
+ *  @ ver 3.3 - Modify the initialization flow to fine-tune a Jetson Orin module
+ *            - must use EMUC2_LIBRARY_VERSION >= ver 2.3.9
  *
  */
 
-#define  EMUC_DAEMON_UTILITY_VERSION  "v2.7"
+#define  EMUC_DAEMON_UTILITY_VERSION  "v3.3"
 
 #endif

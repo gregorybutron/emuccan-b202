@@ -6,6 +6,9 @@
 #include <linux/workqueue.h>
 #include <linux/netdevice.h>
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,31)
+#include <linux/can/dev.h>
+#endif
 
 #include "emuc_parse.h"
 
@@ -47,6 +50,10 @@ typedef struct
 /*--------------------------------------------------------------*/
 typedef struct
 {
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,31)
+    struct can_priv can;	   /* must be the first member */
+  #endif
+
   int             magic;
   EMUC_RAW_INFO  *info;    /* just ptr to emuc_info */
 
@@ -54,11 +61,12 @@ typedef struct
 
 
 /*--------------------------------------------------------------*/
-void emuc_unesc   (EMUC_RAW_INFO *info, unsigned char s);
-void emuc_bump    (EMUC_RAW_INFO *info);
-void emuc_encaps  (EMUC_RAW_INFO *info, int channel, struct can_frame *cf);
-void emuc_transmit(struct work_struct *work);
-void emuc_initCAN (EMUC_RAW_INFO *info, int sts);
+void emuc_unesc       (EMUC_RAW_INFO *info, unsigned char s);
+void emuc_bump        (EMUC_RAW_INFO *info);
+void emuc_bump_error  (EMUC_RAW_INFO *info, EMUC_CAN_FRAME *frame);
+void emuc_encaps      (EMUC_RAW_INFO *info, int channel, struct can_frame *cf);
+void emuc_transmit    (struct work_struct *work);
+void emuc_initCAN     (EMUC_RAW_INFO *info, int sts);
 
 
 

@@ -87,10 +87,17 @@ typedef struct
 
 } VER_INFO;
 
+/*-------------------*/
+typedef struct
+{
+  char   model[VER_LEN];
+  char   can_name[2][IFNAMSIZ+1];
+
+} MODEL_INFO;
 
 extern char *comports [RS232_PORTNR];
 
-extern int EMUCOpenSocketCAN (int com_port);
+extern int EMUCOpenSocketCAN (int com_port, int *fd);
 extern int EMUCCloseDevice   (int com_port);
 extern int EMUCClearFilter   (int com_port, int CAN_port);
 extern int EMUCSetErrorType  (int com_port, int err_type);
@@ -99,8 +106,10 @@ extern int EMUCInitCAN       (int com_port, int CAN1_sts,  int CAN2_sts);
 extern int EMUCSetBaudRate   (int com_port, int CAN1_baud, int CAN2_baud);
 extern int EMUCSetMode       (int com_port, int CAN1_mode, int CAN2_mode);
 /*====================================================================================*/
+#define HIGH_LEVEL_PROTOCAL 0
 
-#define INNO_XMIT_DELAY_CMD 0x14A9
+#define INNO_XMIT_DELAY_CMD 0x14A9 /* in decimal: 5289+0 */
+#define INNO_XMIT_MODEL_CMD 0x14AA /* in decimal: 5289+1 */
 
 /*
  * Ldisc number for emuc.
@@ -124,13 +133,15 @@ static void print_usage (char *prg);
 static void child_handler (int signum);
 static int look_up_emuc_comport (const char *tty);
 static int check_can_speed_format (const char *speed);
+static int check_can_error_type (const char *errorTypeStr, int *errorTypeInt);
 static const char *look_up_can_speed (int speed);
+static const char *look_up_can_error_type (int errorType);
 static char *look_up_xmit_delay (int speed);
 
 /* global variable (for end process) */
 int             port;
 int             ldisc;
-int             fd;
+int             fd = -1;
 int             run_as_daemon = 1;
 speed_t         old_ispeed;
 speed_t         old_ospeed;
@@ -145,6 +156,7 @@ int main (int argc, char *argv[])
   int             channel;
   int             open_com_rtn = 1;
   int             time_out_int = 0;
+  int             errorType = 0;
   char           *pch;
   char           *tty = NULL;
   char           *name[2];
@@ -155,6 +167,8 @@ int main (int argc, char *argv[])
   char const     *devprefix = "/dev/";
   clock_t         start;
   clock_t         time_out;
+  VER_INFO        ver_info;
+  MODEL_INFO      model_info;
 
 #ifdef N_EMUC
   ldisc = N_EMUC;
@@ -166,13 +180,17 @@ int main (int argc, char *argv[])
   name[1] = NULL;
   ttypath[0] = '\0';
 
-  while ((opt = getopt(argc, argv, "s:Fvt:h")) != -1)
+  while ((opt = getopt(argc, argv, "s:e:Fvt:h")) != -1)
   {
     switch (opt)
     {
       case 's':
                 speed = optarg;
                 if (check_can_speed_format(speed) < 0)
+                  print_usage(argv[0]);
+                break;
+      case 'e':
+                if (check_can_error_type(optarg, &errorType) < 0)
                   print_usage(argv[0]);
                 break;
       case 'F':
@@ -232,7 +250,7 @@ int main (int argc, char *argv[])
     /* Check if timeout is needed */
     if(0 == time_out_int)
     {
-      open_com_rtn = EMUCOpenSocketCAN(port);
+      open_com_rtn = EMUCOpenSocketCAN(port, &fd);
     }
     else
     {
@@ -245,7 +263,7 @@ int main (int argc, char *argv[])
 
       while(1)
       {
-        open_com_rtn = EMUCOpenSocketCAN(port);
+        open_com_rtn = EMUCOpenSocketCAN(port, &fd);
 
         if(clock() > (start + time_out))
         {
@@ -263,6 +281,20 @@ int main (int argc, char *argv[])
     /* open COM port successfully */
     if(0 == open_com_rtn)
     {
+#if 1
+      /* inactive device without check return code */
+      EMUCInitCAN(port, EMUC_INACTIVE, EMUC_INACTIVE);
+#else
+      if(EMUCInitCAN(port, EMUC_INACTIVE, EMUC_INACTIVE))
+      {
+        if(run_as_daemon) syslog(LOG_ERR, "EMUCInitCAN() failed!");
+        else              printf("EMUCInitCAN() failed!\n");
+        exit(EXIT_FAILURE);
+      }
+#endif
+
+      EMUCShowVer(port, &ver_info);
+
       if(run_as_daemon) syslog(LOG_INFO, "open comport successfully: %s, %d", ttypath, port);
       else              printf("open comport successfully: %s, %d\n", ttypath, port);
       reset_2_default(port);
@@ -309,6 +341,18 @@ int main (int argc, char *argv[])
         }
       }
 
+      if(0 == EMUCSetErrorType(port, errorType))
+      {
+        if(run_as_daemon) syslog(LOG_INFO, "set can error type to %s on both channel", look_up_can_error_type(errorType));
+        else              printf("set can error type to %s on both channel\n", look_up_can_error_type(errorType));
+      }
+      else
+      {
+        if(run_as_daemon) syslog(LOG_ERR, "EMUCSetErrorType() failed!");
+        else              printf("EMUCSetErrorType() failed!\n");
+        exit(EXIT_FAILURE);
+      }
+
 #if 0 /* emuc active from driver (module version: v2.5) */
       if(EMUCInitCAN(port, EMUC_ACTIVE, EMUC_ACTIVE))
       {
@@ -317,7 +361,6 @@ int main (int argc, char *argv[])
         exit(EXIT_FAILURE);
       }
 #endif
-      EMUCCloseDevice(port);
     }
     else
     {
@@ -345,8 +388,6 @@ int main (int argc, char *argv[])
   emucd_running = 1;
 
   /* Now we are a daemon -- do the work for which we were paid */
-  fd = open(ttypath, O_RDWR | O_NONBLOCK | O_NOCTTY);
-
   if (fd < 0)
   {
     if(run_as_daemon) syslog(LOG_NOTICE, "failed to open TTY device %s\n", ttypath);
@@ -390,7 +431,6 @@ int main (int argc, char *argv[])
     perror("ioctl TIOCSETD");
     exit(EXIT_FAILURE);
   }
-
 
   /* set xmit delay - INNO_XMIT_DELAY_CMD */
   if(ioctl(fd, INNO_XMIT_DELAY_CMD, look_up_xmit_delay(sp_1)) < 0)
@@ -441,9 +481,26 @@ int main (int argc, char *argv[])
         }
         close(s);
       }
+      strncpy(model_info.can_name[channel], name[channel], sizeof(name[channel]));
+      model_info.can_name[channel][strlen(name[channel])] = '\0';
+    }
+    else
+    {
+      strncpy(model_info.can_name[channel], buf, sizeof(buf));
+      model_info.can_name[channel][strlen(buf)] = '\0';
     }
   }
 
+#if HIGH_LEVEL_PROTOCAL
+  /* record model name - INNO_XMIT_MODEL_CMD */
+  strncpy(model_info.model, ver_info.model, sizeof(ver_info.model));
+  model_info.can_name[channel][strlen(ver_info.model)] = '\0';
+  if(ioctl(fd, INNO_XMIT_MODEL_CMD, &model_info) < 0)
+  {
+    perror("ioctl INNO_XMIT_MODEL_CMD");
+    exit(EXIT_FAILURE);
+  }
+#endif
 
   /* The Big Loop */
   if(run_as_daemon) syslog(LOG_INFO, "EMUC-B202 SocketCAN utility ON");
@@ -534,7 +591,7 @@ static void print_version (char *prg)
     fprintf(stdout, "%s\n", "============================");
 
     /* api version */
-    EMUCOpenSocketCAN(com_port);
+    EMUCOpenSocketCAN(com_port, NULL);
     EMUCInitCAN(com_port, EMUC_INACTIVE, EMUC_INACTIVE);
     EMUCShowVer(com_port, &ver_info);
     fprintf(stdout, "FW ver: %s\n",  ver_info.fw);
@@ -559,6 +616,11 @@ static void print_usage (char *prg)
   fprintf(stderr, "                8: 800  KBPS\n");
   fprintf(stderr, "                9: 1000 KBPS\n");
   fprintf(stderr, "                A: 400  KBPS\n");
+  fprintf(stderr, "         -e <errorType>[<errorType>] (set CANbus error type)\n");
+  fprintf(stderr, "                0: EMUC_DIS_ALL\n");
+  fprintf(stderr, "                1: EMUC_EE_ERR\n");
+  fprintf(stderr, "                2: EMUC_BUS_ERR\n");
+  fprintf(stderr, "                3: EMUC_EN_ALL\n");
   fprintf(stderr, "         -F         (stay in foreground; no daemonize)\n");
   fprintf(stderr, "         -h         (show this help page)\n");
   fprintf(stderr, "         -v         (show version info)\n");
@@ -566,6 +628,7 @@ static void print_usage (char *prg)
   fprintf(stderr, "\nExamples:\n");
   fprintf(stderr, "emucd_64 -v /dev/ttyACM0\n");
   fprintf(stderr, "emucd_64 -s7 /dev/ttyACM0\n");
+  fprintf(stderr, "emucd_64 -s7 -e3 /dev/ttyACM0\n");
   fprintf(stderr, "emucd_64 -s79 /dev/ttyACM0 can0 can1\n");
   fprintf(stderr, "emucd_64 -s79 -t10 /dev/ttyACM0 can0 can1\n");
   fprintf(stderr, "(Note: emucd_32 for 32-bit OS)\n");
@@ -637,6 +700,32 @@ static int check_can_speed_format (const char * speed)
 
 
 /*------------------------------------------------------------------------------------*/
+static int check_can_error_type (const char *errorTypeStr, int *errorTypeInt)
+{
+  int          len;
+
+  len = strlen(errorTypeStr);
+
+  if(len < 1 || len > 2)
+    return -1;
+
+  if(atoi(errorTypeStr) == EMUC_DIS_ALL)
+    *errorTypeInt = EMUC_DIS_ALL;
+  else if(atoi(errorTypeStr) == EMUC_EE_ERR)
+    *errorTypeInt = EMUC_EE_ERR;
+  else if(atoi(errorTypeStr) == EMUC_BUS_ERR)
+    *errorTypeInt = EMUC_BUS_ERR;
+  else if(atoi(errorTypeStr) > EMUC_BUS_ERR)
+    *errorTypeInt = EMUC_EN_ALL;
+  else
+    return -2;
+
+  return 0;
+}
+
+
+
+/*------------------------------------------------------------------------------------*/
 static const char *look_up_can_speed (int speed)
 {
   switch (speed)
@@ -651,6 +740,22 @@ static const char *look_up_can_speed (int speed)
     default:  return "unknown";
   }
 }
+
+
+
+/*------------------------------------------------------------------------------------*/
+static const char *look_up_can_error_type (int errorType)
+{
+  switch (errorType)
+  {
+    case EMUC_DIS_ALL:  return "EMUC_DIS_ALL";
+    case EMUC_EE_ERR:   return "EMUC_EE_ERR";
+    case EMUC_BUS_ERR:  return "EMUC_BUS_ERR";
+    case EMUC_EN_ALL:   return "EMUC_EN_ALL";
+    default:            return "unknown";
+  }
+}
+
 
 
 /*------------------------------------------------------------------------------------*/

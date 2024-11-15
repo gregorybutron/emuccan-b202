@@ -1,7 +1,6 @@
 #include <linux/skbuff.h>
 #include <linux/version.h>
 #include <linux/tty.h>
-#include <linux/mutex.h>
 
 #include "transceive.h"
 
@@ -34,6 +33,18 @@ void emuc_unesc (EMUC_RAW_INFO *info, unsigned char s)
 
   info->rcount++;
 
+  /* Read the characters out of the buffer */
+  if(info->rcount == 5 && info->rbuff[0] == CMD_HEAD_INIT && info->rbuff[3] == 0x0D && info->rbuff[4] == 0x0A)  // for send EMUCInitCAN()
+  {
+    if(info->rbuff[1] == 0x00 && info->rbuff[2] == (CMD_HEAD_INIT + info->rbuff[1]))
+      printk(KERN_INFO "emuc: EMUCInitCAN() successfully.\n");
+    else
+      printk(KERN_INFO "emuc: EMUCInitCAN() failed.\n");
+
+    info->rcount = 0;
+    return;
+  }
+
   if(info->rcount == EMUC_MTU)
   {
     emuc_bump(info);
@@ -56,9 +67,16 @@ void emuc_bump (EMUC_RAW_INFO *info)
   memset(&frame, 0, sizeof(frame));
   memcpy(frame.com_buf, info->rbuff, info->rcount);
 
-  if((ret = EMUCRevHex(&frame)) < 0)
+  ret = EMUCRevHex(&frame);
+  if(ret < 0)
   {
     printk("emuc : bump : parse fail %d.\n", ret);
+    return;
+  }
+
+  if(ret == 1)
+  {
+    emuc_bump_error(info, &frame);
     return;
   }
 
@@ -134,9 +152,87 @@ void emuc_bump (EMUC_RAW_INFO *info)
   info->devs[frame.CAN_port - 1]->stats.rx_packets++;
   info->devs[frame.CAN_port - 1]->stats.rx_bytes += cf.can_dlc;
 
-  netif_rx_ni(skb);
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,18,0)
+    netif_rx(skb);
+  #else
+    netif_rx_ni(skb);
+  #endif
 
 } /* END: emuc_bump() */
+
+/*-----------------------------------------------------------------------*/
+void emuc_bump_error (EMUC_RAW_INFO *info, EMUC_CAN_FRAME *frame)
+{
+  int                i, can_port;
+  bool               get_error = false;
+  struct sk_buff    *skb;
+  struct can_frame   cf;
+
+#if _DBG_FUNC
+  print_func_trace(__LINE__, __FUNCTION__);
+#endif
+
+  cf.can_id = CAN_ERR_FLAG | 0x04;
+
+  /* RTR frames may have a dlc > 0 but they never have any data bytes */
+  *(u64 *)(&cf.data) = 0;
+
+  cf.can_dlc = DATA_LEN_ERR + 1;
+
+  cf.data[0] = frame->com_buf[1];
+
+  for(can_port=0; can_port<2; can_port++)
+  {
+    get_error = false;
+
+    for(i=0; i<DATA_LEN_ERR; i++)
+    {
+      cf.data[i + 1] = *(frame->com_buf + (can_port * DATA_LEN_ERR + (i + 2)));
+      if(cf.data[i + 1] || (*(frame->com_buf + 1) == 0x01)) // if EEPROM Error (0x01), Byte 2~13 is 0
+        get_error = true;
+    }
+
+    if(!get_error)
+      continue;
+
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,9,0)
+      skb = dev_alloc_skb(sizeof(struct can_frame) + sizeof(struct can_skb_priv));
+    #else
+      skb = dev_alloc_skb(sizeof(struct can_frame));
+    #endif
+
+    if(!skb)
+    {
+      return;
+    }
+
+    skb->dev       = info->devs[can_port];
+    skb->protocol  = htons(ETH_P_CAN);
+    skb->pkt_type  = PACKET_BROADCAST;
+    skb->ip_summed = CHECKSUM_UNNECESSARY;
+
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,9,0)
+      can_skb_reserve(skb);
+      can_skb_prv(skb)->ifindex = info->devs[can_port]->ifindex;
+    #endif
+
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,5)
+      can_skb_prv(skb)->skbcnt = 0;
+    #endif
+
+    memcpy(skb_put(skb, sizeof(struct can_frame)), &cf, sizeof(struct can_frame));
+
+    info->devs[can_port]->stats.rx_packets++;
+    info->devs[can_port]->stats.rx_bytes += cf.can_dlc;
+
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,18,0)
+      netif_rx(skb);
+    #else
+      netif_rx_ni(skb);
+    #endif
+  }
+
+} /* END: emuc_bump_error() */
 
 /*-----------------------------------------------------------------------*/
 void emuc_encaps (EMUC_RAW_INFO *info, int channel, struct can_frame *cf)

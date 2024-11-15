@@ -46,8 +46,9 @@
 #include <linux/rtnetlink.h>
 #include <linux/if_arp.h>
 #include <linux/delay.h>
-#include <linux/mutex.h>
 #include <linux/kernel.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)
   #include <linux/can/dev.h>
@@ -70,7 +71,9 @@
  */
 #endif
 
-#define INNO_XMIT_DELAY_CMD 0x14A9 /* in decimal: 5289 */
+#define INNO_XMIT_DELAY_CMD 0x14A9 /* in decimal: 5289+0 */
+#define INNO_XMIT_MODEL_CMD 0x14AA /* in decimal: 5289+1 */
+#define VER_LEN 16
 
 /*
  *  v2.1: Joey modify first steady version
@@ -84,11 +87,25 @@
  *        If kernel version < 3.6.0 use register_netdev(), else use register_candev()
  *        Fix RX RTR with data length
  *        emuc_receive_buf() add usleep_range(10, 100);
+ *  V3.0: Start to support high level CANbus protocal
+ *        Add created kernel object for checked device model
+ *        Add ioctl (from user space) command for recorded device model name
+ *        Fix auto active issue when multi canbus
+ *  V3.1: Start to support ERROR auto return command
+ *        usage: candump any,0~0,#20000004 -t z
+ *        must use SocketCAN utility >= ver 3.1
+ *  V3.2: kernel version >= 5.4.0: fix struct can_priv() iuuse
+ *  V3.3: kernel version < 3.15.0: fix struct net_device_ops() iuuse
+ *  V3.4: Fix stop/start CAN frequently to cause parse fail
+ *        EMUC device will auto inactive after setting down "two" CAN port by driver
+ *  V3.5: Modify emuc_ldisc structure for kernel version >= 5.13.0
+ *  V3.6: Modify about related to tty_ldisc's function for kernel version >= 5.14.0
+ *  V3.7: Modify about related to tty_ldisc's function for kernel version >= 5.19.0
  *
  */
 /* module info. */
 /*=====================================================================*/
-MODULE_VERSION("v2.6.1");
+MODULE_VERSION("v3.7");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Innodisk EMUC-B202 CAN interface driver");
 MODULE_ALIAS("Innodisk EMUC-B202");
@@ -106,16 +123,42 @@ module_exit(emuc_exit);
 /*=====================================================================*/
 static int  emuc_open  (struct tty_struct *tty);
 static void emuc_close (struct tty_struct *tty);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
+static void emuc_hangup(struct tty_struct *tty);
+#else
 static int  emuc_hangup(struct tty_struct *tty);
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
+static int  emuc_ioctl (struct tty_struct *tty, unsigned int cmd, unsigned long arg);
+#else
 static int  emuc_ioctl (struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg);
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,6,0)
+static void emuc_receive_buf (struct tty_struct *tty, const u8 *cp, const u8 *fp, size_t count);
+#else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
+static void emuc_receive_buf (struct tty_struct *tty, const unsigned char *cp, const char *fp, int count);
+#else
 static void emuc_receive_buf (struct tty_struct *tty, const unsigned char *cp, char *fp, int count);
+#endif
+#endif
+
 static void emuc_write_wakeup(struct tty_struct *tty);
 
 static struct tty_ldisc_ops emuc_ldisc =
 {
   .owner  = THIS_MODULE,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,13,0)
   .magic  = TTY_LDISC_MAGIC,
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
+  .num		= N_EMUC,
+#endif
   .name   = "emuccan",
+
   .open   = emuc_open,
   .close  = emuc_close,
   .hangup = emuc_hangup,
@@ -136,26 +179,51 @@ static struct net_device_ops emuc_netdev_ops =
   .ndo_open       = emuc_netdev_open,
   .ndo_stop       = emuc_netdev_close,
   .ndo_start_xmit = emuc_xmit,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,15,0)
   .ndo_change_mtu = emuc_change_mtu,
+#endif
 };
-
 
 static void emuc_sync (void);
 static int  emuc_alloc(dev_t line, EMUC_RAW_INFO *info);
 static void emuc_setup(struct net_device *dev);
 static void emuc_free_netdev(struct net_device *dev);
 
+/* entry (4) */
+/*=====================================================================*/
+static ssize_t model_name_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf);
+static void free_can_k_obj(void);
+
+static struct kobj_attribute model_name_attribute = __ATTR(model_name, 0644, model_name_show, NULL);
+static struct kobject *emuc_b202_kobj;
+
+typedef struct
+{
+  char   model[VER_LEN];
+  char   can_name[2][IFNAMSIZ+1];
+
+} MODEL_INFO;
+
+struct can_k_obj
+{
+  struct kobject *kobj;
+  char can_name[IFNAMSIZ+1];
+  char model[VER_LEN];
+  struct can_k_obj *next;
+};
+
+typedef struct can_k_obj CAN_K_OBJ;
+
+
 #if _DBG_FUNC
 void print_func_trace (int line, const char *func); /* extern function */
 #endif
 
-struct mutex xmit_mutex;
 unsigned long xmit_delay = 0;
 int maxdev = 10;
 __initconst const char banner[] = "emuc: EMUC-B202 SocketCAN interface driver\n";
 struct net_device **emuc_devs;
-int netDev_cnt = 0;
-
+CAN_K_OBJ *can_k_obj_head = NULL , *can_k_obj_current = NULL;
 
 /*---------------------------------------------------------------------------------------------------*/
 static int __init emuc_init (void)
@@ -166,7 +234,6 @@ static int __init emuc_init (void)
   print_func_trace(__LINE__, __FUNCTION__);
 #endif
 
-  mutex_init(&xmit_mutex);
 
   if(maxdev < 4)
     maxdev = 4; /* Sanity */
@@ -180,13 +247,21 @@ static int __init emuc_init (void)
     return -ENOMEM;
 
   /* Fill in our line protocol discipline, and register it */
-  status = tty_register_ldisc(N_EMUC, &emuc_ldisc);
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
+    status = tty_register_ldisc(&emuc_ldisc);
+  #else
+    status = tty_register_ldisc(N_EMUC, &emuc_ldisc);
+  #endif
 
   if(status)
   {
     printk(KERN_ERR "emuc: can't register line discipline\n");
     kfree(emuc_devs);
   }
+
+  emuc_b202_kobj = kobject_create_and_add("emuc_b202", kernel_kobj);
+  if(!emuc_b202_kobj)
+    return -ENOMEM;
 
   return status;
 }
@@ -201,7 +276,6 @@ static void __exit emuc_exit (void)
   unsigned long       timeout = jiffies + HZ;
 
   xmit_delay = 0;
-  mutex_unlock(&xmit_mutex);
 
 #if _DBG_FUNC
   print_func_trace(__LINE__, __FUNCTION__);
@@ -264,25 +338,38 @@ static void __exit emuc_exit (void)
       #endif
     }
 
-  #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0)
-    unregister_netdev(dev);
-  #else
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
     unregister_candev(dev);
+  #else
+    unregister_netdev(dev);
   #endif
   }
 
   kfree(emuc_devs);
   emuc_devs = NULL;
 
-  i = tty_unregister_ldisc(N_EMUC);
+  free_can_k_obj();
 
-  if(i)
-    printk(KERN_ERR "emuc: can't unregister ldisc (err %d)\n", i);
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
+    tty_unregister_ldisc(&emuc_ldisc);
+  #else
+    i = tty_unregister_ldisc(N_EMUC);
+    if(i)
+      printk(KERN_ERR "emuc: can't unregister ldisc (err %d)\n", i);
+  #endif
 
 } /* END: emuc_exit() */
 
 /*---------------------------------------------------------------------------------------------------*/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,6,0)
+static void emuc_receive_buf (struct tty_struct *tty, const u8 *cp, const u8 *fp, size_t count)
+#else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
+static void emuc_receive_buf (struct tty_struct *tty, const unsigned char *cp, const char *fp, int count)
+#else
 static void emuc_receive_buf (struct tty_struct *tty, const unsigned char *cp, char *fp, int count)
+#endif
+#endif
 {
   EMUC_RAW_INFO *info = (EMUC_RAW_INFO *) tty->disc_data;
 
@@ -292,16 +379,6 @@ static void emuc_receive_buf (struct tty_struct *tty, const unsigned char *cp, c
 
   if(!info || info->magic != EMUC_MAGIC || (!netif_running(info->devs[0]) && !netif_running(info->devs[1])))
     return;
-
-  /* Read the characters out of the buffer */
-  if(count == 5 && *cp == CMD_HEAD_INIT && *(cp+3) == 0x0D && *(cp+4) == 0x0A)  // for send EMUCInitCAN()
-  {
-    if(*(cp+1) == 0x00 && *(cp+2) == (CMD_HEAD_INIT + *(cp+1)))
-      printk(KERN_INFO "emuc: Device set \"active\" successfully.\n");
-    else
-      printk(KERN_INFO "emuc: Device set \"active\" failed.\n");
-    return;
-  }
 
   usleep_range(10, 100);
 
@@ -393,7 +470,6 @@ static int emuc_open (struct tty_struct *tty)
       goto ERR_EXIT;
   #endif /* USES_ALLOC_CANDEV */
 
-
     err = register_netdevice(info->devs[0]);
     if(err)
       goto ERR_FREE_CHAN;
@@ -401,7 +477,7 @@ static int emuc_open (struct tty_struct *tty)
     err = register_netdevice(info->devs[1]);
     if(err)
     {
-      #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0)
+      #if LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0)
         unregister_netdev(info->devs[0]);
       #else
         unregister_candev(info->devs[0]);
@@ -451,12 +527,12 @@ static void emuc_close (struct tty_struct *tty)
   flush_work(&info->tx_work);
 
   /* Flush network side */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0)
-  unregister_netdev(info->devs[0]);
-  unregister_netdev(info->devs[1]);
-#else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
   unregister_candev(info->devs[0]);
   unregister_candev(info->devs[1]);
+#else
+  unregister_netdev(info->devs[0]);
+  unregister_netdev(info->devs[1]);
 #endif
   /* This will complete via emuc_free_netdev */
 }
@@ -464,21 +540,36 @@ static void emuc_close (struct tty_struct *tty)
 
 
 /*---------------------------------------------------------------------------------------------------*/
-static int emuc_hangup (struct tty_struct *tty)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
+static void emuc_hangup(struct tty_struct *tty)
+#else
+static int  emuc_hangup(struct tty_struct *tty)
+#endif
 {
 #if _DBG_FUNC
   print_func_trace(__LINE__, __FUNCTION__);
 #endif
 
   emuc_close(tty);
-  return 0;
+
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
+    return;
+  #else
+    return 0;
+  #endif
 }
 
 /*---------------------------------------------------------------------------------------------------*/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
+static int emuc_ioctl (struct tty_struct *tty, unsigned int cmd, unsigned long arg)
+#else
 static int emuc_ioctl (struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg)
+#endif
 {
   int            channel;
   unsigned int   tmp;
+  unsigned long  ret_ulong;
+  int            ret_int;
   EMUC_RAW_INFO *info = (EMUC_RAW_INFO *) tty->disc_data;
 
 #if _DBG_FUNC
@@ -495,15 +586,83 @@ static int emuc_ioctl (struct tty_struct *tty, struct file *file, unsigned int c
                         {
                           char delay_str[5]; /* 0 ~ 1000 */
 
-                          copy_from_user(delay_str, (void __user *)arg, 5);
-                          delay_str[4] = '\0';
-                          kstrtol(delay_str, 10, &xmit_delay);
+                          ret_ulong = copy_from_user(delay_str, (void __user *)arg, 5);
+                          if(ret_ulong)
+                          {
+                            printk(KERN_INFO "emuc: copy_from_user() failed (ret: %ld).\n", ret_ulong);
+                            return -2;
+                          }
 
-                          printk("----------> INNO_XMIT_DELAY_CMD ioctl(), xmit_delay = %lu\n", xmit_delay);
+                          delay_str[4] = '\0';
+
+                          ret_int = kstrtol(delay_str, 10, &xmit_delay);
+                          if(ret_int)
+                          {
+                            printk(KERN_INFO "emuc: kstrtol() failed (ret: %d).\n", ret_int);
+                            return -3;
+                          }
+
+                          printk(KERN_INFO "----------> INNO_XMIT_DELAY_CMD ioctl(), xmit_delay = %lu\n", xmit_delay);
                           if(xmit_delay > 1000)
                           {
                             return -1;
                           }
+                          return 0;
+                        }
+
+    case INNO_XMIT_MODEL_CMD:
+                        {
+                          /* create kernel object for checked device model */
+                          int channel;
+                          static MODEL_INFO model_info;
+
+                          ret_ulong = copy_from_user(&model_info, (void __user *)arg, sizeof(MODEL_INFO));
+                          if(ret_ulong)
+                          {
+                            printk(KERN_INFO "emuc: copy_from_user() failed (ret: %ld).\n", ret_ulong);
+                            return -2;
+                          }
+
+                          printk(KERN_INFO "----------> INNO_XMIT_MODEL_CMD ioctl(), model:%s, can_name[0]:%s, can_name[1]:%s\n",
+                                 model_info.model, model_info.can_name[0], model_info.can_name[1]);
+
+                          for(channel = 0; channel < 2;)
+                          {
+                            if(!can_k_obj_head)
+                            {
+                              can_k_obj_head = (CAN_K_OBJ *) kmalloc(sizeof(CAN_K_OBJ), GFP_USER);
+                              can_k_obj_head->kobj = kobject_create_and_add(model_info.can_name[channel], emuc_b202_kobj);
+                              if(!can_k_obj_head->kobj)
+                              {
+                                free_can_k_obj();
+                                return -ENOMEM;
+                              }
+                              if(sysfs_create_file(can_k_obj_head->kobj, &model_name_attribute.attr))
+                                kobject_put(can_k_obj_head->kobj);
+                              strcpy(can_k_obj_head->can_name, model_info.can_name[channel]);
+                              strcpy(can_k_obj_head->model, model_info.model);
+                              can_k_obj_head->next = NULL;
+                              can_k_obj_current = can_k_obj_head;
+                            }
+                            else
+                            {
+                              can_k_obj_current->next = (CAN_K_OBJ *) kmalloc(sizeof(CAN_K_OBJ), GFP_USER);
+                              can_k_obj_current = can_k_obj_current->next;
+                              can_k_obj_current->kobj = kobject_create_and_add(model_info.can_name[channel], emuc_b202_kobj);
+                              if(!can_k_obj_current->kobj)
+                              {
+                                free_can_k_obj();
+                                return -ENOMEM;
+                              }
+                              if(sysfs_create_file(can_k_obj_current->kobj, &model_name_attribute.attr))
+                                kobject_put(can_k_obj_current->kobj);
+                              strcpy(can_k_obj_current->can_name, model_info.can_name[channel]);
+                              strcpy(can_k_obj_current->model, model_info.model);
+                              can_k_obj_current->next = NULL;
+                            }
+                            channel++;
+                          }
+                          
                           return 0;
                         }
 
@@ -523,7 +682,11 @@ static int emuc_ioctl (struct tty_struct *tty, struct file *file, unsigned int c
                         return -EINVAL;
 
     default:
-                        return tty_mode_ioctl(tty, file, cmd, arg);
+                        #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
+                          return tty_mode_ioctl(tty, cmd, arg);
+                        #else
+                          return tty_mode_ioctl(tty, file, cmd, arg);
+                        #endif
   }
 }
 
@@ -542,6 +705,7 @@ static void emuc_write_wakeup (struct tty_struct *tty)
 /*---------------------------------------------------------------------------------------------------*/
 static int emuc_netdev_open (struct net_device *dev)
 {
+  int            channel;
   EMUC_RAW_INFO *info = ((EMUC_PRIV *) netdev_priv(dev))->info;
 
 #if _DBG_FUNC
@@ -554,9 +718,9 @@ static int emuc_netdev_open (struct net_device *dev)
   info->flags &= (1 << SLF_INUSE);
   netif_start_queue(dev);
 
-  netDev_cnt++;
+  channel = (dev->base_addr & 0xF00) >> 8;
 
-  if(netDev_cnt == 2)
+  if (netif_running(info->devs[!channel]))
   {
     emuc_initCAN(info, EMUC_ACTIVE);
     printk(KERN_INFO "emuc: Device will become active status.\n");
@@ -598,6 +762,12 @@ static int emuc_netdev_close (struct net_device *dev)
     /* another netdev is closed (down) too, reset TTY buffers. */
     info->rcount   = 0;
     info->xleft    = 0;
+
+    if(info->tty)
+    {
+      emuc_initCAN(info, EMUC_INACTIVE);
+      printk(KERN_INFO "emuc: Device will become inactive status.\n");
+    }
   }
 
   spin_unlock_bh(&info->lock);
@@ -607,17 +777,9 @@ static int emuc_netdev_close (struct net_device *dev)
 /*---------------------------------------------------------------------------------------------------*/
 static netdev_tx_t emuc_xmit (struct sk_buff *skb, struct net_device *dev)
 {
-  /*======================*/
-  mutex_lock(&xmit_mutex);
-  /*======================*/
-
   int             channel;
   EMUC_RAW_INFO  *info = ((EMUC_PRIV *) netdev_priv(dev))->info;
 
-  if(xmit_delay)
-  {
-    udelay(xmit_delay);
-  }
 
 #if _DBG_FUNC
   print_func_trace(__LINE__, __FUNCTION__);
@@ -627,6 +789,11 @@ static netdev_tx_t emuc_xmit (struct sk_buff *skb, struct net_device *dev)
     goto OUT;
 
   spin_lock(&info->lock);
+
+  if(xmit_delay)
+  {
+    udelay(xmit_delay);
+  }
 
   if(!netif_running(dev))
   {
@@ -656,9 +823,6 @@ static netdev_tx_t emuc_xmit (struct sk_buff *skb, struct net_device *dev)
   spin_unlock(&info->lock);
 
 OUT:
-  /*======================*/
-  mutex_unlock(&xmit_mutex);
-  /*======================*/
   kfree_skb(skb);
   return NETDEV_TX_OK;
 
@@ -851,6 +1015,39 @@ static void emuc_free_netdev (struct net_device *dev)
     printk("free_netdev: free info\n");
     kfree(info);
   }
+}
+
+/*---------------------------------------------------------------------------------------------------*/
+static void free_can_k_obj(void)
+{
+  CAN_K_OBJ *tmp;
+  can_k_obj_current = can_k_obj_head;
+
+	while(can_k_obj_current != NULL)
+  {
+		tmp = can_k_obj_current;
+		can_k_obj_current = can_k_obj_current->next;
+    kobject_put(tmp->kobj);
+		kfree(tmp);
+	}
+ 
+  kobject_put(emuc_b202_kobj);
+} /* END: free_can_k_obj() */
+
+/*---------------------------------------------------------------------------------------------------*/
+static ssize_t model_name_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+  CAN_K_OBJ *scan;
+  scan = can_k_obj_head;
+
+	while(scan != NULL)
+  {
+    if(!strcmp(scan->can_name, kobj->name))
+      break;
+		scan = scan->next;
+	}
+
+  return sprintf(buf, "%s", scan->model);
 }
 
 #if _DBG_FUNC
